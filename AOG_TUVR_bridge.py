@@ -37,6 +37,14 @@ from tuvr_protocol import (
 BAUD = 38400
 DEFAULT_SECTION_COUNT = 8
 
+# Fork version (gordosmiki): adds AOG 6.3.x "remote switch" feedback via
+# PGN 0xEA so manual section / master changes made on the controller show
+# up in older AgOpenGPS versions that have no ISOBUS (PGN 0xF0) support.
+BRIDGE_VERSION = "4.1.0-gm1"
+DEFAULT_OVERRIDE_GRACE_MS = 2000      # commanded ON but reported OFF this long -> operator override
+DEFAULT_OVERRIDE_MIN_SPEED = 1.0      # km/h; below this no new override is latched
+REMOTE_SWITCH_MAX_SECTIONS = 16       # PGN 0xEA carries 2 x 8 section bits
+
 # ---------------------------------------------------------------------------
 #  Timing
 # ---------------------------------------------------------------------------
@@ -105,6 +113,21 @@ def load_config() -> ConfigParser:
             #     is enabled in AgIO; otherwise it is silently ignored.
             # 0 = do not transmit the ISOBUS PGN 0xF0 feedback packet.
             "send_isobus_feedback": "1",
+            # 1 = report manual changes made on the controller back to
+            #     AgOpenGPS through the remote-switch PGN 0xEA (works with
+            #     AOG 6.3.x, which has no ISOBUS PGN 0xF0 support):
+            #       - section switched OFF on the controller while AOG
+            #         wants it ON -> AOG section forced OFF (no painting)
+            #       - section switched back ON on the controller -> AOG
+            #         section returns to Auto
+            "remote_switch_feedback": "1",
+            # 1 = mirror the controller's master switch to AOG's master
+            #     (Auto) button through PGN 0xEA (edge-triggered in AOG).
+            "remote_main": "1",
+            # Commanded ON but reported OFF for this long = operator override.
+            "override_grace_ms": str(DEFAULT_OVERRIDE_GRACE_MS),
+            # No new override is latched below this AOG speed (km/h).
+            "override_min_speed": str(DEFAULT_OVERRIDE_MIN_SPEED),
         }
         config["logging"] = {
             # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
@@ -342,11 +365,20 @@ class TUVRRequester:
                  sct_hz: int, spd_hz: int, status_hz: int,
                  use_implement_master: bool,
                  send_isobus_feedback: bool,
-                 config: ConfigParser) -> None:
+                 config: ConfigParser,
+                 remote_switch_feedback: bool = True,
+                 remote_main: bool = True,
+                 override_grace_s: float = DEFAULT_OVERRIDE_GRACE_MS / 1000.0,
+                 override_min_speed: float = DEFAULT_OVERRIDE_MIN_SPEED) -> None:
         self.ser = ser
         self.config = config
         self.use_implement_master = use_implement_master
         self.send_isobus_feedback = send_isobus_feedback
+        # --- gm1: remote-switch feedback for AOG 6.3.x (PGN 0xEA) ---
+        self.remote_switch_feedback = remote_switch_feedback
+        self.remote_main = remote_main
+        self.override_grace_s = max(0.2, override_grace_s)
+        self.override_min_speed = max(0.0, override_min_speed)
         # Last decoded controller master-switch bit; None until first STATUS_RESP
         self.controller_master_on: Optional[bool] = None
         # Last decoded operational-mode bitfield from STATUS_RESP (16-bit)
@@ -391,6 +423,10 @@ class TUVRRequester:
 
         # Section state
         self.target_sections = [0] * self.section_count          # from AOG
+        # gm1: time.time() when AOG last switched each section ON
+        self.target_on_since = [0.0] * self.section_count
+        # gm1: latched "operator switched this section OFF on the controller"
+        self.override_off = [False] * self.section_count
         self.machine_sections: Optional[List[int]] = None         # last from controller
         self._last_sent_section_bits: int = -1
         self._last_speed_log: float = 0.0
@@ -533,10 +569,14 @@ class TUVRRequester:
             new_sections[i] = 1 if (section_bits >> i) & 1 else 0
 
         changed = False
+        now = time.time()
         with self.section_cmd_lock:
             with self.sections_lock:
                 if new_sections != self.target_sections:
                     changed = True
+                    for i, on in enumerate(new_sections):
+                        if on and not self.target_sections[i]:
+                            self.target_on_since[i] = now
                 self.target_sections = new_sections
 
             # Send immediately on change so the controller reacts without waiting.
@@ -677,6 +717,65 @@ class TUVRRequester:
             self.controller_phys_switches = phys
             self._update_controller_section_mask()
 
+    # ---- gm1: operator-override detection for AOG 6.3.x ----
+    def update_overrides(self) -> None:
+        """Latch / release 'operator switched section OFF' per section.
+
+        Latch when AOG has wanted the section ON for longer than the grace
+        time, the controller master is ON, the tractor is moving, and the
+        controller still reports the section OFF.  Release as soon as the
+        controller reports that section ON again (operator turned it back
+        on), which lets AOG take it back into Auto.
+        """
+        if not self.remote_switch_feedback or self.machine_sections is None:
+            return
+        now = time.time()
+        with self.sections_lock:
+            target = list(self.target_sections)
+            on_since = list(self.target_on_since)
+            speed = self.current_speed_kmh
+        cur = self.machine_sections
+        n = min(self.section_count, REMOTE_SWITCH_MAX_SECTIONS, len(cur))
+        for i in range(n):
+            if self.override_off[i]:
+                if cur[i]:
+                    self.override_off[i] = False
+                    logger.info(
+                        f"OPERATOR OVERRIDE released: section {i + 1} ON on "
+                        f"controller -> AOG section back to Auto")
+            elif (target[i] and not cur[i]
+                  and self.controller_master_on
+                  and speed >= self.override_min_speed
+                  and now - on_since[i] >= self.override_grace_s):
+                self.override_off[i] = True
+                logger.info(
+                    f"OPERATOR OVERRIDE: section {i + 1} OFF on controller "
+                    f"-> AOG section forced OFF")
+
+    def reset_overrides(self, reason: str) -> None:
+        if any(self.override_off):
+            logger.info(f"Operator overrides cleared ({reason})")
+        self.override_off = [False] * self.section_count
+
+    def remote_off_mask(self) -> int:
+        mask = 0
+        for i, on in enumerate(self.override_off[:REMOTE_SWITCH_MAX_SECTIONS]):
+            if on:
+                mask |= (1 << i)
+        return mask
+
+    def remote_main_byte(self) -> int:
+        """PGN 0xEA main-switch byte: 1 = master ON, 2 = master OFF, 0 = unknown.
+
+        AOG 6.3.x acts on a *change* of this byte, so it is sent as a
+        steady level; AOG's own master button stays usable in between.
+        """
+        if not (self.remote_switch_feedback and self.remote_main):
+            return 0
+        if self.controller_master_on is None:
+            return 0
+        return 1 if self.controller_master_on else 2
+
     def _refresh_switch_pgn(self) -> None:
         """Rebuild SwitchPGN with the current relay bytes + master authority."""
         main_on = True
@@ -730,6 +829,8 @@ class TUVRRequester:
         if cur != self.machine_sections:
             self.machine_sections = cur
             logger.info(f"Controller sections = {cur}")
+
+        self.update_overrides()
 
         # Update relay/off masks for AgOpenGPS feedback PGNs.
         # In auto-mode AOG is the master and feeding back the
@@ -880,7 +981,16 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
                 # PGN 0xE5, causing rapid ON/OFF toggling.
 
                 if req.state == MachineState.RUNNING:
-                    if req.is_auto_mode:
+                    req.update_overrides()
+                    if req.is_auto_mode and req.remote_switch_feedback:
+                        # gm1: auto mode + remote-switch feedback.  Only the
+                        # latched operator overrides go out as OFF bits; the
+                        # ON bits stay 0 so AOG keeps driving the sections.
+                        off_mask = req.remote_off_mask()
+                        ea_relay_lo, ea_relay_hi = 0, 0
+                        ea_off_lo = off_mask & 0xFF
+                        ea_off_hi = (off_mask >> 8) & 0xFF
+                    elif req.is_auto_mode:
                         # Auto mode: AOG drives sections.  Do NOT feed
                         # back the controller's stale relay/off state --
                         # that causes a race where AOG sees "off" before
@@ -893,8 +1003,11 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
                         ea_relay_hi = req.relay_hi
                         ea_off_lo = req.off_lo
                         ea_off_hi = req.off_hi
+                    main_bits = (req.remote_main_byte()
+                                 if req.remote_switch_feedback
+                                 else req.main_sw_bits)
                     sect_data = build_section_data(
-                        req.main_sw_bits,
+                        main_bits,
                         ea_relay_lo, ea_relay_hi,
                         ea_off_lo, ea_off_hi)
                     sock.sendto(sect_data, broadcast)
@@ -964,7 +1077,8 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
 
 def keyboard_loop(req: TUVRRequester) -> None:
     logger.info("Keyboard: X=exit  S=status  H=re-send handshake  "
-                "I=toggle ISOBUS SC  0=all-off  A=all-on  1=section1-only")
+                "I=toggle ISOBUS SC  0=all-off  A=all-on  1=section1-only  "
+                "R=clear operator overrides")
     while req.running:
         if msvcrt.kbhit():
             key = msvcrt.getch()
@@ -987,6 +1101,7 @@ def keyboard_loop(req: TUVRRequester) -> None:
                     f"master={req.controller_master_on}  "
                     f"opmode={opmode_str}  "
                     f"isobus_sc={req.isobus_sc_enabled}  "
+                    f"overrides={[i + 1 for i, o in enumerate(req.override_off) if o]}  "
                     f"prot_sent={req.prot_version_sent}")
             elif key in (b"h", b"H"):
                 # Manual re-send of the startup handshake.  Useful when
@@ -1014,6 +1129,8 @@ def keyboard_loop(req: TUVRRequester) -> None:
             elif key == b"1":
                 logger.info("Manual test: forcing only section 1 ON")
                 req.update_sections_from_aog(0x0001)
+            elif key in (b"r", b"R"):
+                req.reset_overrides("keyboard")
         time.sleep(0.05)
 
 
@@ -1024,7 +1141,8 @@ def keyboard_loop(req: TUVRRequester) -> None:
 def main() -> None:
     config = load_config()
     logger.info(f"Logging to file: {LOG_PATH}")
-    print("AOG-TUVR Bridge  (AgOpenGPS <-> TUVR VR controller)")
+    print(f"AOG-TUVR Bridge {BRIDGE_VERSION}  (AgOpenGPS <-> TUVR VR controller)")
+    logger.info(f"Bridge version {BRIDGE_VERSION}")
     print()
 
     saved_com = config.get("main", "com", fallback="0")
@@ -1039,12 +1157,21 @@ def main() -> None:
     send_isobus = config.getboolean(
         "main", "send_isobus_feedback", fallback=True)
     subnet = config.get("main", "subnet", fallback="255.255.255.255")
+    remote_fb = config.getboolean("main", "remote_switch_feedback",
+                                  fallback=True)
+    remote_main = config.getboolean("main", "remote_main", fallback=True)
+    grace_ms = config.getint("main", "override_grace_ms",
+                             fallback=DEFAULT_OVERRIDE_GRACE_MS)
+    min_speed = config.getfloat("main", "override_min_speed",
+                                fallback=DEFAULT_OVERRIDE_MIN_SPEED)
 
     print(f"Config: sections={section_count}  SCT={sct_hz}Hz  "
           f"SPD={spd_hz}Hz  STATUS={status_hz}Hz  "
           f"comms_lost_zero={comms_lost_zero}  "
           f"use_implement_master={use_impl_master}  "
           f"send_isobus_feedback={send_isobus}  subnet={subnet}")
+    print(f"        remote_switch_feedback={remote_fb}  remote_main={remote_main}  "
+          f"override_grace_ms={grace_ms}  override_min_speed={min_speed}")
     print()
 
     available = {p.device for p in serial.tools.list_ports.comports()}
@@ -1074,7 +1201,11 @@ def main() -> None:
     parser = StreamParser()
     requester = TUVRRequester(ser, section_count, sct_hz, spd_hz,
                               status_hz, use_impl_master,
-                              send_isobus, config)
+                              send_isobus, config,
+                              remote_switch_feedback=remote_fb,
+                              remote_main=remote_main,
+                              override_grace_s=grace_ms / 1000.0,
+                              override_min_speed=min_speed)
 
     threads = [
         threading.Thread(target=udp_listener_loop,

@@ -192,3 +192,30 @@ Any other function received from the controller is logged and ignored.
 
 This bridge is a clean-room implementation for AgOpenGPS. It does not
 include, redistribute or quote any third-party protocol specification.
+
+
+## Fork addition (gordosmiki, v4.1.0-gm1): feedback for older AgOpenGPS (6.3.x)
+
+AgOpenGPS 6.3.x has no ISOBUS PGN 0xF0 support, so manual changes made on
+the controller (e.g. Quantron-A) were not visible in AOG.  This version
+reports them through the remote-switch PGN 0xEA, which AOG 6.3.x already
+understands (`DoRemoteSwitches`):
+
+* **Section switched OFF on the controller** while AOG wants it ON (longer
+  than `override_grace_ms`, master ON, speed >= `override_min_speed`):
+  the section is forced OFF in AOG (no painting) and stays off.
+* **Section switched back ON on the controller**: the override is released
+  and AOG takes the section back into Auto.
+* **Controller master switch** (`remote_main = 1`): ON -> AOG master Auto,
+  OFF -> AOG master off.  AOG reacts on changes only, so its own master
+  button stays usable.
+
+Keyboard `R` clears all latched overrides.  Up to 16 sections (PGN 0xEA
+limit).  AOG must use sections (not zones).
+
+| INI key | Default | Meaning |
+|---|---|---|
+| `remote_switch_feedback` | 1 | enable PGN 0xEA operator-override feedback |
+| `remote_main` | 1 | mirror controller master switch to AOG master |
+| `override_grace_ms` | 2000 | commanded ON but reported OFF this long = operator override |
+| `override_min_speed` | 1.0 | km/h; no new override latched below this speed |
