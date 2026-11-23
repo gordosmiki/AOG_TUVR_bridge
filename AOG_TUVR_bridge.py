@@ -40,7 +40,7 @@ DEFAULT_SECTION_COUNT = 8
 # Fork version (gordosmiki): adds AOG 6.3.x "remote switch" feedback via
 # PGN 0xEA so manual section / master changes made on the controller show
 # up in older AgOpenGPS versions that have no ISOBUS (PGN 0xF0) support.
-BRIDGE_VERSION = "4.1.0-gm2"
+BRIDGE_VERSION = "4.1.0-gm3"
 DEFAULT_OVERRIDE_GRACE_MS = 2000      # commanded ON but reported OFF this long -> operator override
 DEFAULT_OVERRIDE_MIN_SPEED = 1.0      # km/h; below this no new override is latched
 REMOTE_SWITCH_MAX_SECTIONS = 16       # PGN 0xEA carries 2 x 8 section bits
@@ -585,7 +585,7 @@ class TUVRRequester:
 
             # Send immediately on change so the controller reacts without waiting.
             if changed and self.state == MachineState.RUNNING:
-                bits = [bool(s) for s in new_sections]
+                bits = self._controller_cmd(new_sections)
                 self._send(build_section_state_cmd(bits),
                            f"SECTION_STATE_CMD (change) {_bits_to_str(bits)}")
                 self._last_sent_section_bits = section_bits
@@ -698,7 +698,7 @@ class TUVRRequester:
                             bits |= (1 << i)
                     self._last_sent_section_bits = bits
                     # Force re-send even if bits match last sent (master changed)
-                    section_list = [bool(on) for on in target]
+                    section_list = self._controller_cmd(target)
                     self._send(build_section_state_cmd(section_list),
                                f"SECTION_STATE_CMD (master ON) {_bits_to_str(section_list)}")
 
@@ -726,6 +726,27 @@ class TUVRRequester:
             self._update_controller_section_mask()
 
     # ---- gm1: operator-override detection for AOG 6.3.x ----
+    def _controller_cmd(self, target) -> List[bool]:
+        """gm3: section bits sent to the controller.
+
+        A section the operator switched OFF on the controller keeps being
+        commanded ON (the controller's own switch keeps it off).  Otherwise
+        the controller could never report it ON again when the operator
+        re-enables it, because AOG has meanwhile switched it off.
+        """
+        ov = self.override_off
+        return [bool(t) or (i < len(ov) and ov[i]) for i, t in enumerate(target)]
+
+    def _resend_section_cmd(self, reason: str) -> None:
+        if self.state != MachineState.RUNNING:
+            return
+        with self.section_cmd_lock:
+            with self.sections_lock:
+                target = list(self.target_sections)
+            bits = self._controller_cmd(target)
+            self._send(build_section_state_cmd(bits),
+                       f"SECTION_STATE_CMD ({reason}) {_bits_to_str(bits)}")
+
     def update_overrides(self) -> None:
         """Latch / release 'operator switched section OFF' per section.
 
@@ -744,6 +765,7 @@ class TUVRRequester:
             speed = self.current_speed_kmh
         cur = self.machine_sections
         n = min(self.section_count, REMOTE_SWITCH_MAX_SECTIONS, len(cur))
+        released = False
         for i in range(n):
             cond = (target[i] and not cur[i]
                     and self.controller_master_on
@@ -759,18 +781,25 @@ class TUVRRequester:
                     logger.info(
                         f"OPERATOR OVERRIDE released: section {i + 1} ON on "
                         f"controller -> AOG section back to Auto")
+                    released = True
             elif (cond and now - self.override_pending_since[i]
                   >= self.override_debounce_s):
                 self.override_off[i] = True
                 logger.info(
                     f"OPERATOR OVERRIDE: section {i + 1} OFF on controller "
                     f"-> AOG section forced OFF")
+        if released:
+            # hand the section back to AOG's own decision
+            self._resend_section_cmd("override released")
 
     def reset_overrides(self, reason: str) -> None:
-        if any(self.override_off):
+        had = any(self.override_off)
+        if had:
             logger.info(f"Operator overrides cleared ({reason})")
         self.override_off = [False] * self.section_count
         self.override_pending_since = [0.0] * self.section_count
+        if had:
+            self._resend_section_cmd("overrides cleared")
 
     def remote_off_mask(self) -> int:
         mask = 0

@@ -194,7 +194,7 @@ This bridge is a clean-room implementation for AgOpenGPS. It does not
 include, redistribute or quote any third-party protocol specification.
 
 
-## Fork addition (gordosmiki, v4.1.0-gm2): feedback for older AgOpenGPS (6.3.x)
+## Fork addition (gordosmiki, v4.1.0-gm3): feedback for older AgOpenGPS (6.3.x)
 
 AgOpenGPS 6.3.x has no ISOBUS PGN 0xF0 support, so manual changes made on
 the controller (e.g. Quantron-A) were not visible in AOG.  This version
