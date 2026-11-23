@@ -40,7 +40,7 @@ DEFAULT_SECTION_COUNT = 8
 # Fork version (gordosmiki): adds AOG 6.3.x "remote switch" feedback via
 # PGN 0xEA so manual section / master changes made on the controller show
 # up in older AgOpenGPS versions that have no ISOBUS (PGN 0xF0) support.
-BRIDGE_VERSION = "4.1.0-gm1"
+BRIDGE_VERSION = "4.1.0-gm2"
 DEFAULT_OVERRIDE_GRACE_MS = 2000      # commanded ON but reported OFF this long -> operator override
 DEFAULT_OVERRIDE_MIN_SPEED = 1.0      # km/h; below this no new override is latched
 REMOTE_SWITCH_MAX_SECTIONS = 16       # PGN 0xEA carries 2 x 8 section bits
@@ -427,6 +427,10 @@ class TUVRRequester:
         self.target_on_since = [0.0] * self.section_count
         # gm1: latched "operator switched this section OFF on the controller"
         self.override_off = [False] * self.section_count
+        # gm2: when the "section OFF while AOG wants it ON" condition began
+        # (0 = not pending).  Latch only after it held for override_debounce_s.
+        self.override_pending_since = [0.0] * self.section_count
+        self.override_debounce_s = 1.0
         self.machine_sections: Optional[List[int]] = None         # last from controller
         self._last_sent_section_bits: int = -1
         self._last_speed_log: float = 0.0
@@ -672,6 +676,10 @@ class TUVRRequester:
             logger.info(
                 f"Controller master switch -> {'ON' if master_on else 'OFF'}")
             self.controller_master_on = master_on
+            # gm2: a master-switch change on the controller always clears the
+            # per-section overrides (the controller drops all sections a few
+            # ms before it reports master OFF, which must not latch).
+            self.reset_overrides(f"controller master {'ON' if master_on else 'OFF'}")
             # Push an updated SwitchPGN so AOG sees the change immediately
             # (only relevant when we're mirroring it).
             if self.use_implement_master:
@@ -737,16 +745,22 @@ class TUVRRequester:
         cur = self.machine_sections
         n = min(self.section_count, REMOTE_SWITCH_MAX_SECTIONS, len(cur))
         for i in range(n):
+            cond = (target[i] and not cur[i]
+                    and self.controller_master_on
+                    and speed >= self.override_min_speed
+                    and now - on_since[i] >= self.override_grace_s)
+            if not cond:
+                self.override_pending_since[i] = 0.0
+            elif self.override_pending_since[i] == 0.0:
+                self.override_pending_since[i] = now
             if self.override_off[i]:
                 if cur[i]:
                     self.override_off[i] = False
                     logger.info(
                         f"OPERATOR OVERRIDE released: section {i + 1} ON on "
                         f"controller -> AOG section back to Auto")
-            elif (target[i] and not cur[i]
-                  and self.controller_master_on
-                  and speed >= self.override_min_speed
-                  and now - on_since[i] >= self.override_grace_s):
+            elif (cond and now - self.override_pending_since[i]
+                  >= self.override_debounce_s):
                 self.override_off[i] = True
                 logger.info(
                     f"OPERATOR OVERRIDE: section {i + 1} OFF on controller "
@@ -756,6 +770,7 @@ class TUVRRequester:
         if any(self.override_off):
             logger.info(f"Operator overrides cleared ({reason})")
         self.override_off = [False] * self.section_count
+        self.override_pending_since = [0.0] * self.section_count
 
     def remote_off_mask(self) -> int:
         mask = 0
@@ -1189,14 +1204,26 @@ def main() -> None:
 
     logger.info(f"Opening {port} @ {BAUD} baud")
 
-    ser = serial.Serial(
-        port=port,
-        baudrate=BAUD,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_ONE,
-        timeout=0.05,
-    )
+    try:
+        ser = serial.Serial(
+            port=port,
+            baudrate=BAUD,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.05,
+        )
+    except Exception as e:  # gm2: keep the console window open
+        logger.error(f"Cannot open {port}: {e}")
+        print()
+        print(f"*** {port} nem nyithato meg / cannot be opened: {e}")
+        print("*** Foglalja mas program (pl. AgIO COM-port beallitas)?")
+        print("*** Is another program (e.g. AgIO serial port) using it?")
+        try:
+            input("Enter = kilepes / exit ")
+        except EOFError:
+            pass
+        return
 
     parser = StreamParser()
     requester = TUVRRequester(ser, section_count, sct_hz, spd_hz,
