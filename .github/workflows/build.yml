@@ -2,8 +2,11 @@ name: Build AOG-TUVR
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -26,27 +29,36 @@ jobs:
         python -m pip install --upgrade pip
         pip install pyinstaller pyserial
 
+    - name: Read version
+      id: ver
+      shell: pwsh
+      run: |
+        $m = Select-String -Path AOG_TUVR_bridge.py -Pattern 'BRIDGE_VERSION = "([^"]+)"'
+        $v = $m.Matches[0].Groups[1].Value
+        Write-Host "Version: $v"
+        "version=$v" >> $env:GITHUB_OUTPUT
+
     - name: Build AOG-TUVR
       run: |
         $ICON_FLAG = ""
         if (Test-Path "icon.ico") {
           $ICON_FLAG = "--icon=icon.ico"
-          Write-Host "Using icon: icon.ico"
-        } else {
-          Write-Host "WARNING: icon.ico not found!"
         }
-        pyinstaller --onefile --console --name "AOG-TUVR" $ICON_FLAG "AOG_TUVR_bridge.py"
+        pyinstaller --onefile --console --name "AOG-TUVR-v${{ steps.ver.outputs.version }}" $ICON_FLAG "AOG_TUVR_bridge.py"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: AOG-TUVR
-        path: dist/AOG-TUVR.exe
+        name: AOG-TUVR-v${{ steps.ver.outputs.version }}
+        path: dist/AOG-TUVR-v${{ steps.ver.outputs.version }}.exe
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
-        files: dist/AOG-TUVR.exe
+        tag_name: v${{ steps.ver.outputs.version }}
+        name: AOG-TUVR v${{ steps.ver.outputs.version }}
+        target_commitish: ${{ github.sha }}
+        files: dist/AOG-TUVR-v${{ steps.ver.outputs.version }}.exe
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
